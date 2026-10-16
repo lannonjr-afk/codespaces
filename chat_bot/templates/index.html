@@ -33,6 +33,7 @@
       const input = document.querySelector("#message");
       const conversation = document.querySelector("#conversation");
       const status = document.querySelector("#status");
+      const button = form.querySelector("button");
 
       function addMessage(role, text) {
         const item = document.createElement("section");
@@ -41,12 +42,20 @@
         conversation.append(item);
       }
 
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+          event.preventDefault();
+          form.requestSubmit();
+        }
+      });
+
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
+        if (button.disabled) return;
+
         const message = input.value.trim();
         if (!message) return;
 
-        const button = form.querySelector("button");
         button.disabled = true;
         status.textContent = "";
         addMessage("user", message);
