@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: aura-chat
+    runtime: python
+    plan: free
+    rootDir: chat_bot
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn newai:app --bind 0.0.0.0:$PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+      - key: APP_USERNAME
+        value: aura
