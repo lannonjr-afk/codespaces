@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
 import sqlite3
 from typing import Any, Optional
 
@@ -24,8 +23,6 @@ if GROQ_API_KEY:
 else:
     MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 DB_PATH = os.getenv("DB_PATH", "agent_memory.db")
-APP_USERNAME = os.getenv("APP_USERNAME", "aura")
-APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 CONTEXT_MESSAGES = 4
 
 # =========================================================
@@ -658,30 +655,6 @@ class Aura:
 
 
 app = Flask(__name__)
-
-
-@app.before_request
-def require_web_authentication():
-    if request.endpoint == "healthz":
-        return None
-    if not APP_PASSWORD:
-        return jsonify(error="Web access is not configured."), 503
-
-    credentials = request.authorization
-    if (
-        credentials is not None
-        and credentials.type.lower() == "basic"
-        and credentials.username is not None
-        and credentials.password is not None
-        and secrets.compare_digest(credentials.username, APP_USERNAME)
-        and secrets.compare_digest(credentials.password, APP_PASSWORD)
-    ):
-        return None
-
-    response = jsonify(error="Authentication required.")
-    response.status_code = 401
-    response.headers["WWW-Authenticate"] = 'Basic realm="AURA"'
-    return response
 
 
 @app.get("/")
