@@ -19,10 +19,12 @@ The `TAVILY_API_KEY` setting is not currently used by this application.
 The chat page accepts multiple text and code files, CSV, XLSX, DOCX, text-based
 PDF, and PNG/JPEG/WEBP images (up to 5 MB total per request). Files are read for
 that request and are not saved. Scanned or password-protected PDFs are not
-supported. Extracted text is limited to 100,000 characters per file. Image
-questions require setting `GROQ_VISION_MODEL` in the Render service environment
-to a vision-capable model available to your account; text questions continue
-using `GROQ_MODEL`.
+supported. Extracted text is limited to 100,000 characters per file. Text
+attachments longer than 6,000 characters are analyzed in overlapping chunks
+and combined into a final answer, using multiple model requests. Image questions
+require setting `GROQ_VISION_MODEL` in the Render service environment to a
+vision-capable model available to your account; text questions continue using
+`GROQ_MODEL`.
 
 The Blueprint uses Render's free web-service plan, so the SQLite conversation
 history is on ephemeral storage and can be lost when the service restarts or

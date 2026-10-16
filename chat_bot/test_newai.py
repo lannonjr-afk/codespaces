@@ -87,6 +87,66 @@ class WebAppTests(unittest.TestCase):
         finally:
             memory.close()
 
+    def test_attachment_chunks_cover_full_text_with_overlap(self):
+        text = "".join(f"line {index:04d}\n" for index in range(1500))
+        chunks = newai.chunk_attachment_text(text)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(
+            all(
+                len(chunk) <= newai.ATTACHMENT_CHUNK_CHARACTERS
+                for chunk in chunks
+            )
+        )
+
+        reconstructed = chunks[0]
+        for chunk in chunks[1:]:
+            overlap = min(len(reconstructed), len(chunk))
+            while overlap and not reconstructed.endswith(chunk[:overlap]):
+                overlap -= 1
+            self.assertGreater(overlap, 0)
+            reconstructed += chunk[overlap:]
+
+        self.assertEqual(reconstructed, text)
+
+    def test_long_attachment_is_analyzed_in_chunks_before_final_answer(self):
+        memory = newai.SimpleMemory(str(Path(self.temp_dir.name) / "chunks.db"))
+        text = (
+            "START OF FILE\n"
+            + ("A" * newai.ATTACHMENT_CHUNK_CHARACTERS)
+            + "\nMIDDLE OF FILE\n"
+            + ("B" * newai.ATTACHMENT_CHUNK_CHARACTERS)
+            + "\nEND OF FILE"
+        )
+        chunks = newai.chunk_attachment_text(text)
+        notes = [f"segment {index} notes" for index in range(len(chunks))]
+        try:
+            aura = newai.Aura(memory)
+            with patch.object(
+                aura,
+                "_complete",
+                side_effect=[*notes, "Final answer"],
+            ) as complete:
+                answer = aura.answer_directly(
+                    "Explain this file.",
+                    [newai.ChatAttachment("new_ai.py", text=text)],
+                )
+
+            self.assertEqual(answer, "Final answer")
+            self.assertEqual(complete.call_count, len(chunks) + 1)
+            segment_requests = [
+                call.args[0][-1]["content"]
+                for call in complete.call_args_list[:-1]
+            ]
+            self.assertIn("START OF FILE", segment_requests[0])
+            self.assertIn("MIDDLE OF FILE", "\n".join(segment_requests))
+            self.assertIn("END OF FILE", segment_requests[-1])
+            final_request = complete.call_args_list[-1].args[0][-1]["content"]
+            for note in notes:
+                self.assertIn(note, final_request[1]["text"])
+        finally:
+            memory.close()
+
     def test_pdf_upload_extracts_text(self):
         page = Mock()
         page.extract_text.return_value = "PDF document text."
