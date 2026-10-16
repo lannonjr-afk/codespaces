@@ -17,6 +17,8 @@ from io import BytesIO
 from typing import Any, Optional
 
 from flask import Flask, jsonify, render_template, request
+from docx import Document
+from docx.opc.exceptions import PackageNotFoundError
 from openai import OpenAI, OpenAIError
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
@@ -78,6 +80,7 @@ IMAGE_MIME_TYPES = {
     ".webp": "image/webp",
 }
 SUPPORTED_EXTENSIONS = TEXT_EXTENSIONS | {
+    ".docx",
     ".pdf",
     ".xlsx",
 } | set(IMAGE_MIME_TYPES)
@@ -874,6 +877,41 @@ def extract_attachment(uploaded_file: FileStorage) -> ChatAttachment:
             workbook.close()
         text = "\n".join(rows)
         return ChatAttachment(filename=filename, text=_check_text_size(text))
+
+    if extension == ".docx":
+        try:
+            document = Document(BytesIO(content))
+        except (PackageNotFoundError, ValueError, zipfile.BadZipFile) as error:
+            raise ValueError(
+                f"{filename} could not be read as a Word document."
+            ) from error
+
+        parts = []
+        character_count = 0
+        for paragraph in document.paragraphs:
+            paragraph_text = paragraph.text
+            character_count += len(paragraph_text)
+            if character_count > MAX_DOCUMENT_CHARACTERS:
+                raise ValueError(
+                    "Extracted file text must be 100,000 characters or less per file."
+                )
+            if paragraph_text:
+                parts.append(paragraph_text)
+
+        for table in document.tables:
+            for row in table.rows:
+                row_text = "\t".join(cell.text for cell in row.cells)
+                character_count += len(row_text)
+                if character_count > MAX_DOCUMENT_CHARACTERS:
+                    raise ValueError(
+                        "Extracted file text must be 100,000 characters or less per file."
+                    )
+                if row_text.strip():
+                    parts.append(row_text)
+
+        return ChatAttachment(
+            filename=filename, text=_check_text_size("\n".join(parts))
+        )
 
     raise ValueError(f"{filename} could not be read.")
 

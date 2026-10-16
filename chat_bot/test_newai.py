@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import newai
+from docx import Document
 from openpyxl import Workbook
 
 
@@ -111,7 +112,7 @@ class WebAppTests(unittest.TestCase):
             "/api/chat",
             data={
                 "message": "Read this.",
-                "document": (BytesIO(b"data"), "document.docx"),
+                "document": (BytesIO(b"data"), "document.unsupported"),
             },
         )
 
@@ -161,6 +162,32 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(attachment.filename, "sales.xlsx")
         self.assertIn("Sheet: Sales", attachment.text)
         self.assertIn("Apples\t12", attachment.text)
+
+    def test_docx_upload_extracts_paragraphs_and_tables(self):
+        document = Document()
+        document.add_paragraph("Quarterly report")
+        table = document.add_table(rows=1, cols=2)
+        table.cell(0, 0).text = "Revenue"
+        table.cell(0, 1).text = "$100"
+        content = BytesIO()
+        document.save(content)
+
+        with patch.object(
+            newai.Aura, "answer_directly", return_value="Revenue is $100."
+        ) as answer_directly:
+            response = self.client.post(
+                "/api/chat",
+                data={
+                    "message": "What is the revenue?",
+                    "documents": (BytesIO(content.getvalue()), "report.docx"),
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        attachment = answer_directly.call_args.args[1][0]
+        self.assertEqual(attachment.filename, "report.docx")
+        self.assertIn("Quarterly report", attachment.text)
+        self.assertIn("Revenue\t$100", attachment.text)
 
     def test_image_upload_requires_vision_model_setting(self):
         response = self.client.post(

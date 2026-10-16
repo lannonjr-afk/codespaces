@@ -16,8 +16,8 @@ available to your account. The local command-line mode continues to use Ollama
 when `GROQ_API_KEY` is unset.
 The `TAVILY_API_KEY` setting is not currently used by this application.
 
-The chat page accepts multiple text and code files, CSV, XLSX, text-based PDF,
-and PNG/JPEG/WEBP images (up to 5 MB total per request). Files are read for
+The chat page accepts multiple text and code files, CSV, XLSX, DOCX, text-based
+PDF, and PNG/JPEG/WEBP images (up to 5 MB total per request). Files are read for
 that request and are not saved. Scanned or password-protected PDFs are not
 supported. Extracted text is limited to 100,000 characters per file. Image
 questions require setting `GROQ_VISION_MODEL` in the Render service environment
