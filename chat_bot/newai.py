@@ -19,7 +19,7 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if GROQ_API_KEY:
-    MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 else:
     MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 DB_PATH = os.getenv("DB_PATH", "agent_memory.db")
@@ -744,3 +744,5 @@ def main(db_path: str = "agent_memory.db") -> None:
 
 if __name__ == "__main__":
     main()
+
+# To commit changes: git add chat_bot/newai.py chat_bot/README.md && git commit -m "Update default Groq model"

@@ -10,9 +10,10 @@
 The web app is public and does not require a login. Anyone with the service URL
 can use it and send requests to the chat API.
 
-The service uses Groq's OpenAI-compatible API by default. Set `GROQ_MODEL` in
-Render if you want to select a different model available to your account. The
-local command-line mode continues to use Ollama when `GROQ_API_KEY` is unset.
+The service uses Groq's OpenAI-compatible API and defaults to
+`openai/gpt-oss-120b`. Set `GROQ_MODEL` in Render to choose another model
+available to your account. The local command-line mode continues to use Ollama
+when `GROQ_API_KEY` is unset.
 The `TAVILY_API_KEY` setting is not currently used by this application.
 
 The Blueprint uses Render's free web-service plan, so the SQLite conversation
