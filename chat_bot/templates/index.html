@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AURA</title>
+    <style>
+      :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; }
+      body { max-width: 48rem; margin: 3rem auto; padding: 0 1rem; background: #111827; color: #f3f4f6; }
+      h1 { margin-bottom: .25rem; }
+      #conversation { display: grid; gap: 1rem; margin: 2rem 0; }
+      .message { white-space: pre-wrap; overflow-wrap: anywhere; padding: 1rem; border-radius: .75rem; background: #1f2937; }
+      .user { background: #263650; }
+      form { display: grid; gap: .75rem; }
+      textarea { box-sizing: border-box; width: 100%; min-height: 6rem; padding: .75rem; border: 1px solid #4b5563; border-radius: .5rem; background: #1f2937; color: inherit; font: inherit; }
+      button { justify-self: end; padding: .65rem 1.2rem; border: 0; border-radius: .5rem; background: #2563eb; color: white; font: inherit; cursor: pointer; }
+      button:disabled { opacity: .6; cursor: wait; }
+      #status { min-height: 1.5em; color: #fca5a5; }
+    </style>
+  </head>
+  <body>
+    <h1>AURA</h1>
+    <p>Your assistant. Conversation history is stored by this service.</p>
+    <main id="conversation" aria-live="polite"></main>
+    <form id="chat-form">
+      <label for="message">Message</label>
+      <textarea id="message" name="message" required></textarea>
+      <p id="status" role="status"></p>
+      <button type="submit">Send</button>
+    </form>
+    <script>
+      const form = document.querySelector("#chat-form");
+      const input = document.querySelector("#message");
+      const conversation = document.querySelector("#conversation");
+      const status = document.querySelector("#status");
+
+      function addMessage(role, text) {
+        const item = document.createElement("section");
+        item.className = `message ${role}`;
+        item.textContent = `${role === "user" ? "You" : "AURA"}: ${text}`;
+        conversation.append(item);
+      }
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const message = input.value.trim();
+        if (!message) return;
+
+        const button = form.querySelector("button");
+        button.disabled = true;
+        status.textContent = "";
+        addMessage("user", message);
+        input.value = "";
+
+        try {
+          const response = await fetch("/api/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message }),
+          });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.error || "Request failed.");
+          addMessage("assistant", result.response);
+        } catch (error) {
+          status.textContent = error.message;
+        } finally {
+          button.disabled = false;
+          input.focus();
+        }
+      });
+    </script>
+  </body>
+</html>
