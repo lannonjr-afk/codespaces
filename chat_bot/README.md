@@ -16,6 +16,11 @@ available to your account. The local command-line mode continues to use Ollama
 when `GROQ_API_KEY` is unset.
 The `TAVILY_API_KEY` setting is not currently used by this application.
 
+The chat page accepts `.txt` and text-based `.pdf` files up to 5 MB. The
+document is read for that request and is not saved; scanned PDFs and
+password-protected PDFs are not supported. Extracted text is limited to
+100,000 characters.
+
 The Blueprint uses Render's free web-service plan, so the SQLite conversation
 history is on ephemeral storage and can be lost when the service restarts or
 redeploys. For durable memory, use a paid Render plan with a persistent disk,
