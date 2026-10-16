@@ -999,5 +999,4 @@ def main(db_path: str = "agent_memory.db") -> None:
 if __name__ == "__main__":
     main()
 
-# To commit changes: git add chat_bot/newai.py chat_bot/README.md && git commit -m "Update"
-# git push origin main
+# To commit changes: git push origin main
