@@ -345,5 +345,190 @@ class WebAppTests(unittest.TestCase):
         )
 
 
+class YouTubeLookupTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path_patch = patch.object(
+            newai, "DB_PATH", str(Path(self.temp_dir.name) / "test.db")
+        )
+        self.db_path_patch.start()
+        self.client = newai.app.test_client()
+
+    def tearDown(self):
+        self.db_path_patch.stop()
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _channel_page(title="Example Creator", count="1.23M subscribers"):
+        import json
+
+        data = {
+            "header": {
+                "pageHeaderRenderer": {
+                    "content": {
+                        "pageHeaderViewModel": {
+                            "metadata": {
+                                "contentMetadataViewModel": {
+                                    "metadataRows": [
+                                        {
+                                            "metadataParts": [
+                                                {
+                                                    "text": {"content": count},
+                                                    "accessibilityLabel": count,
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "metadata": {
+                "channelMetadataRenderer": {
+                    "title": title,
+                    "externalId": "UC123",
+                }
+            },
+        }
+        return f"var ytInitialData = {json.dumps(data)};"
+
+    @staticmethod
+    def _search_page(*channels):
+        import json
+
+        data = {
+            "contents": [
+                {
+                    "channelRenderer": {
+                        "channelId": channel_id,
+                        "title": {"simpleText": title},
+                    }
+                }
+                for title, channel_id in channels
+            ]
+        }
+        return f"var ytInitialData = {json.dumps(data)};"
+
+    def test_handle_lookup_returns_subscriber_count_source_and_check_time(self):
+        response = BytesIO(self._channel_page().encode())
+        with patch.object(newai, "urlopen", return_value=response) as urlopen:
+            answer = newai.lookup_youtube_subscribers("@example")
+
+        self.assertIn(
+            "YouTube currently displays about 1.23M subscribers for "
+            "Example Creator.",
+            answer,
+        )
+        self.assertIn("https://www.youtube.com/channel/UC123", answer)
+        self.assertRegex(answer, r"checked \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC")
+        self.assertEqual(
+            urlopen.call_args.args[0].full_url, "https://www.youtube.com/@example"
+        )
+
+    def test_name_search_asks_user_to_disambiguate_instead_of_guessing(self):
+        response = BytesIO(
+            self._search_page(
+                ("Demo Creator", "UC111"), ("Demo Gaming", "UC222")
+            ).encode()
+        )
+        with patch.object(newai, "urlopen", return_value=response) as urlopen:
+            answer = newai.lookup_youtube_subscribers("Demo")
+
+        self.assertIn("couldn't reliably identify the right one", answer)
+        self.assertIn("Demo Creator", answer)
+        self.assertIn("Demo Gaming", answer)
+        urlopen.assert_called_once()
+
+    def test_exact_name_search_fetches_channel_page(self):
+        search_result = BytesIO(
+            self._search_page(
+                ("Example Creator", "UC123"),
+                ("Example  Creator", "UC456"),
+            ).encode()
+        )
+        channel_page = BytesIO(self._channel_page().encode())
+        with patch.object(
+            newai, "urlopen", side_effect=[search_result, channel_page]
+        ) as urlopen:
+            answer = newai.lookup_youtube_subscribers("Example Creator")
+
+        self.assertIn("1.23M subscribers", answer)
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(
+            urlopen.call_args_list[1].args[0].full_url,
+            "https://www.youtube.com/channel/UC123",
+        )
+
+    def test_exact_spelling_takes_precedence_over_similar_name(self):
+        search_result = BytesIO(
+            self._search_page(
+                ("MrBeast", "UC123"),
+                ("Mr beast", "UC456"),
+            ).encode()
+        )
+        channel_page = BytesIO(self._channel_page(title="MrBeast").encode())
+        with patch.object(
+            newai, "urlopen", side_effect=[search_result, channel_page]
+        ) as urlopen:
+            answer = newai.lookup_youtube_subscribers("MrBeast")
+
+        self.assertIn("MrBeast", answer)
+        self.assertIn("UC123", urlopen.call_args_list[1].args[0].full_url)
+
+    def test_subscriber_question_uses_live_lookup_without_calling_model(self):
+        memory = newai.SimpleMemory(":memory:")
+        response = BytesIO(self._channel_page().encode())
+        try:
+            aura = newai.Aura(memory)
+            with (
+                patch.object(newai, "urlopen", return_value=response),
+                patch.object(aura, "_complete") as complete,
+            ):
+                answer = aura.answer_directly(
+                    "How many subs does @example have?"
+                )
+
+            self.assertIn(
+                "YouTube currently displays about 1.23M subscribers for "
+                "Example Creator.",
+                answer,
+            )
+            complete.assert_not_called()
+        finally:
+            memory.close()
+
+    def test_possessive_subscriber_question_is_recognized(self):
+        memory = newai.SimpleMemory(":memory:")
+        response = BytesIO(self._channel_page().encode())
+        try:
+            aura = newai.Aura(memory)
+            with (
+                patch.object(newai, "urlopen", return_value=response),
+                patch.object(aura, "_complete") as complete,
+            ):
+                answer = aura.answer_directly(
+                    "What's @example's subscriber count?"
+                )
+
+            self.assertIn("Example Creator", answer)
+            complete.assert_not_called()
+        finally:
+            memory.close()
+
+    def test_network_errors_are_reported_by_chat_endpoint(self):
+        with patch.object(
+            newai, "urlopen", side_effect=newai.URLError("offline")
+        ):
+            response = self.client.post(
+                "/api/chat",
+                json={"message": "How many subscribers does @example have?"},
+            )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("Could not reach YouTube", response.json["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

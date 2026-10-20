@@ -14,7 +14,13 @@ The service uses Groq's OpenAI-compatible API and defaults to
 `openai/gpt-oss-120b`. Set `GROQ_MODEL` in Render to choose another model
 available to your account. The local command-line mode continues to use Ollama
 when `GROQ_API_KEY` is unset.
-The `TAVILY_API_KEY` setting is not currently used by this application.
+YouTube subscriber questions read the channel's public YouTube page and do not
+require an API key. Use a channel handle or channel URL for the most reliable
+match. A display name is searched; if AURA cannot identify an exact match, it
+asks you to select a channel. Counts are displayed as YouTube presents them
+(often rounded), with the channel source and UTC check time. This page-based
+lookup may stop working if YouTube changes its page format or blocks automated
+requests.
 
 The chat page accepts multiple text and code files, CSV, XLSX, DOCX, text-based
 PDF, and PNG/JPEG/WEBP images (up to 5 MB total per request). Files are read for

@@ -9,8 +9,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode, urlsplit
+from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, render_template, request
 from openai import OpenAI, OpenAIError
@@ -18,13 +23,290 @@ from openai import OpenAI, OpenAIError
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL")
 if GROQ_API_KEY:
     MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 else:
     MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 DB_PATH = os.getenv("DB_PATH", "agent_memory.db")
+ENABLE_ATTACHMENTS = os.getenv("ENABLE_ATTACHMENTS", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 CONTEXT_MESSAGES = 4
+YOUTUBE_BASE_URL = "https://www.youtube.com"
+YOUTUBE_PAGE_TIMEOUT_SECONDS = 15
+YOUTUBE_PAGE_MAX_BYTES = 5_000_000
+YOUTUBE_SUBSCRIBER_QUESTION = re.compile(
+    r"\bhow many\s+(?:youtube\s+)?(?:subscribers|subs)\s+(?:does|do)\s+"
+    r"(?P<channel>.+?)\s+(?:currently\s+)?have"
+    r"(?:\s+currently|\s+right now|\s+today)?"
+    r"(?:\s+on\s+youtube)?[?.!]*$",
+    re.IGNORECASE,
+)
+YOUTUBE_SUBSCRIBER_COUNT_QUESTION = re.compile(
+    r"\b(?:subscriber|subscribers|sub|subs)\s+count\s+(?:for|of)\s+"
+    r"(?P<channel>.+?)[?.!]*$",
+    re.IGNORECASE,
+)
+YOUTUBE_POSSESSIVE_SUBSCRIBER_QUESTION = re.compile(
+    r"\bwhat(?:'s| is)\s+(?P<channel>.+?)(?:'s|’s)\s+"
+    r"(?:youtube\s+)?(?:subscriber|subscribers|sub|subs)\s+count[?.!]*$",
+    re.IGNORECASE,
+)
+
+
+class YouTubeLookupError(Exception):
+    """An error that can be shown to the user when a live lookup fails."""
+
+    def __init__(self, message: str, status_code: int = 502):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _fetch_youtube_page(url: str) -> str:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (compatible; AURA/1.0; +https://www.youtube.com)"
+            ),
+            "Accept-Language": "en",
+        },
+    )
+    try:
+        with urlopen(request, timeout=YOUTUBE_PAGE_TIMEOUT_SECONDS) as response:
+            page = response.read(YOUTUBE_PAGE_MAX_BYTES + 1)
+    except HTTPError as exc:
+        raise YouTubeLookupError(
+            f"YouTube blocked or rejected the lookup (HTTP {exc.code}). "
+            "Try again later or provide the channel's exact handle."
+        ) from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise YouTubeLookupError(
+            "Could not reach YouTube to check the current subscriber count. "
+            "Check the network and try again."
+        ) from exc
+    if len(page) > YOUTUBE_PAGE_MAX_BYTES:
+        raise YouTubeLookupError("YouTube's page was too large to process.")
+    return page.decode("utf-8", errors="replace")
+
+
+def _youtube_channel_url(reference: str) -> str | None:
+    reference = reference.strip()
+    if reference.startswith("@"):
+        handle = quote(reference[1:], safe="._-")
+        return f"{YOUTUBE_BASE_URL}/@{handle}"
+    if re.fullmatch(r"UC[\w-]{22}", reference):
+        return f"{YOUTUBE_BASE_URL}/channel/{reference}"
+
+    candidate_url = reference if "://" in reference else ""
+    if not candidate_url and reference.lower().startswith("youtube.com/"):
+        candidate_url = f"{YOUTUBE_BASE_URL}/{reference[len('youtube.com/') :]}"
+    if not candidate_url:
+        return None
+
+    parsed = urlsplit(candidate_url)
+    if parsed.hostname not in {
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+    }:
+        return None
+    if not parsed.path or parsed.path == "/":
+        return None
+    return f"{YOUTUBE_BASE_URL}{parsed.path}"
+
+
+def _youtube_initial_data(page: str) -> dict[str, Any]:
+    marker = re.search(r"ytInitialData\s*=\s*", page)
+    if not marker:
+        raise YouTubeLookupError(
+            "YouTube did not provide page data for this lookup. "
+            "It may be blocking automated requests."
+        )
+    try:
+        data, _ = json.JSONDecoder().raw_decode(page[marker.end() :])
+    except json.JSONDecodeError as exc:
+        raise YouTubeLookupError("YouTube returned unreadable page data.") from exc
+    if not isinstance(data, dict):
+        raise YouTubeLookupError("YouTube returned invalid page data.")
+    return data
+
+
+def _youtube_text(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, dict):
+        return None
+    simple_text = value.get("simpleText")
+    if isinstance(simple_text, str):
+        return simple_text
+    runs = value.get("runs")
+    if isinstance(runs, list):
+        text = "".join(
+            run["text"]
+            for run in runs
+            if isinstance(run, dict) and isinstance(run.get("text"), str)
+        )
+        if text:
+            return text
+    return None
+
+
+def _youtube_channel_candidates(data: Any) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    seen_ids: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            renderer = value.get("channelRenderer")
+            if isinstance(renderer, dict):
+                channel_id = renderer.get("channelId")
+                title = _youtube_text(renderer.get("title"))
+                if (
+                    isinstance(channel_id, str)
+                    and title
+                    and channel_id not in seen_ids
+                ):
+                    candidates.append((title, channel_id))
+                    seen_ids.add(channel_id)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(data)
+    return candidates
+
+
+def _find_channel_title(data: dict[str, Any]) -> str | None:
+    metadata = data.get("metadata")
+    if isinstance(metadata, dict):
+        channel_metadata = metadata.get("channelMetadataRenderer")
+        if isinstance(channel_metadata, dict):
+            title = channel_metadata.get("title")
+            if isinstance(title, str):
+                return title
+    return None
+
+
+def _find_channel_subscriber_count(data: dict[str, Any]) -> str | None:
+    try:
+        header = data["header"]["pageHeaderRenderer"]["content"]
+        view_model = header["pageHeaderViewModel"]
+        metadata = view_model["metadata"]["contentMetadataViewModel"]
+        rows = metadata["metadataRows"]
+    except (KeyError, TypeError):
+        return None
+    if not isinstance(rows, list):
+        return None
+
+    for row in rows:
+        parts = row.get("metadataParts", []) if isinstance(row, dict) else []
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            count_text = text.get("content") if isinstance(text, dict) else None
+            accessibility = part.get("accessibilityLabel")
+            if (
+                isinstance(count_text, str)
+                and isinstance(accessibility, str)
+                and "subscriber" in accessibility.casefold()
+            ):
+                match = re.search(
+                    r"([\d,.]+\s*[KMB]?)\s+subscribers?",
+                    count_text,
+                    re.IGNORECASE,
+                )
+                if match:
+                    return match.group(1).strip()
+    return None
+
+
+def _resolve_youtube_channel(reference: str) -> tuple[str, str] | str:
+    search_url = (
+        f"{YOUTUBE_BASE_URL}/results?"
+        f"{urlencode({'search_query': reference, 'sp': 'EgIQAg=='})}"
+    )
+    data = _youtube_initial_data(_fetch_youtube_page(search_url))
+    candidates = _youtube_channel_candidates(data)
+    exact_name_matches = [
+        (title, channel_id)
+        for title, channel_id in candidates
+        if title.strip().casefold() == reference.strip().casefold()
+    ]
+    if len(exact_name_matches) == 1:
+        return exact_name_matches[0]
+    normalized_reference = re.sub(r"\W+", "", reference).casefold()
+    normalized_matches = [
+        (title, channel_id)
+        for title, channel_id in candidates
+        if re.sub(r"\W+", "", title).casefold() == normalized_reference
+    ]
+    if len(normalized_matches) == 1:
+        return normalized_matches[0]
+    if not candidates:
+        raise YouTubeLookupError(
+            f"I couldn't find a YouTube channel matching {reference!r}. "
+            "Try its exact @handle or channel URL."
+        )
+
+    options = "\n".join(
+        f"- {title} — {YOUTUBE_BASE_URL}/channel/{channel_id}"
+        for title, channel_id in candidates[:5]
+    )
+    return (
+        f"I found possible YouTube channels for {reference!r}, but couldn't "
+        "reliably identify the right one. Reply with the exact @handle or "
+        f"channel URL:\n{options}"
+    )
+
+
+def lookup_youtube_subscribers(reference: str) -> str:
+    """Read the public subscriber count from a YouTube channel page."""
+    channel_url = _youtube_channel_url(reference)
+    if channel_url:
+        source = channel_url
+        title = reference
+    else:
+        resolved = _resolve_youtube_channel(reference)
+        if isinstance(resolved, str):
+            return resolved
+        title, channel_id = resolved
+        channel_url = f"{YOUTUBE_BASE_URL}/channel/{channel_id}"
+        source = channel_url
+
+    data = _youtube_initial_data(_fetch_youtube_page(channel_url))
+    title = _find_channel_title(data) or title
+    metadata = data.get("metadata")
+    channel_metadata = (
+        metadata.get("channelMetadataRenderer", {})
+        if isinstance(metadata, dict)
+        else {}
+    )
+    if isinstance(channel_metadata, dict):
+        channel_id = channel_metadata.get("externalId")
+        if isinstance(channel_id, str):
+            source = f"{YOUTUBE_BASE_URL}/channel/{channel_id}"
+    checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    subscriber_count = _find_channel_subscriber_count(data)
+    if subscriber_count is None:
+        return (
+            f"YouTube's public page doesn't show a subscriber count for "
+            f"{title}; it may be hidden. Source: {source} "
+            f"(checked {checked_at})."
+        )
+    return (
+        f"YouTube currently displays about {subscriber_count} subscribers for "
+        f"{title}. "
+        f"Source: {source} (checked {checked_at})."
+    )
 
 # =========================================================
 # 1. PERSISTENT MEMORY (SQLite)
@@ -468,7 +750,7 @@ Adapt your conversational style to how the user treats you across the current an
 
 Use blunt asides and mild, roast-like exasperation in low-stakes situations, including simple questions. For example, to "What is 5+5?" answer "Dude, it's 10. Come on." If the user repeatedly asks for the same revision (for example, asking to shorten an answer again and again), say so with an exasperated line like "Again? Fine—here's the shorter version." Then do what they asked. Keep the edge aimed at the situation, not the user's worth or intelligence: no slurs, threats, sustained berating, or genuinely humiliating language. Drop the attitude for serious, sensitive, or urgent topics, and never let it get in the way of being helpful.
 
-Accuracy matters more than sounding confident. Never invent facts, numbers, sources, quotes, or actions. This assistant has no live web search: answer stable questions from knowledge, but say when current or local facts cannot be verified. Separate facts from assumptions and hypotheses. If you do not know, say so and suggest how to check. Correct false premises tactfully. Never claim to have searched, tested, run code, or verified something unless you actually did.
+Accuracy matters more than sounding confident. Never invent facts, numbers, sources, quotes, or actions. This assistant has no general live web search; YouTube subscriber questions are checked against the channel's public page. Answer stable questions from knowledge, but say when current or local facts cannot be verified. Separate facts from assumptions and hypotheses. If you do not know, say so and suggest how to check. Correct false premises tactfully. Never claim to have searched, tested, run code, or verified something unless you actually did.
 
 For explanations, lead with the main idea and add useful examples. For recommendations, explain the trade-offs and base the choice on the user's priorities. For coding and troubleshooting, use the supplied code and error as evidence; suggest the smallest complete root-cause fix, distinguish hypotheses from confirmed causes, and never claim an unrun test passed. For procedures, order steps clearly and flag important risks. For multi-part requests, answer every part.
 
@@ -591,7 +873,16 @@ class Aura:
     # -----------------------------------------------------
 
     def answer_directly(self, user_input: str) -> str:
-        """Fast path: no search needed."""
+        """Answer directly, checking public YouTube pages for subscriber counts."""
+        for pattern in (
+            YOUTUBE_SUBSCRIBER_QUESTION,
+            YOUTUBE_SUBSCRIBER_COUNT_QUESTION,
+            YOUTUBE_POSSESSIVE_SUBSCRIBER_QUESTION,
+        ):
+            match = pattern.search(user_input)
+            if match:
+                return lookup_youtube_subscribers(match.group("channel").strip())
+
         messages = self._context_messages(SYSTEM_PROMPT, user_input)
         return self._complete(messages)
 
@@ -682,6 +973,17 @@ def healthz():
 
 @app.post("/api/chat")
 def chat():
+    if request.files and not ENABLE_ATTACHMENTS:
+        return (
+            jsonify(
+                error=(
+                    "Attachment uploads are disabled in text-only mode. "
+                    "Set ENABLE_ATTACHMENTS=true to re-enable them."
+                )
+            ),
+            400,
+        )
+
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict) or not isinstance(payload.get("message"), str):
         return jsonify(error="Send a JSON object with a string 'message' field."), 400
@@ -695,6 +997,9 @@ def chat():
         aura = Aura(memory)
         answer = aura.answer_and_record(user_input)
         return jsonify(response=answer)
+    except YouTubeLookupError as exc:
+        app.logger.warning("YouTube subscriber lookup failed: %s", exc)
+        return jsonify(error=str(exc)), exc.status_code
     except OpenAIError:
         app.logger.exception("The configured language model request failed.")
         return (
