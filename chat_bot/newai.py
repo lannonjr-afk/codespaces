@@ -1,5 +1,8 @@
 """AURA chat assistant with a customizable system prompt and SQLite memory.
 
+Large inputs are automatically trimmed and older context is bounded so the bot
+stays inside model context limits without exploding memory usage.
+
 The CLI uses local Ollama by default. Set ``GROQ_API_KEY`` to use Groq's
 OpenAI-compatible API instead. The Flask app exposes the same assistant over
 HTTP for deployment.
