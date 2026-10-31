@@ -4,6 +4,7 @@ import sqlite3
 from typing import Optional
 
 from flask import Flask, jsonify, render_template, request
+from groq import Groq
 
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
@@ -138,35 +139,42 @@ class Aura:
         messages.append({"role": "user", "content": user_input})
         return messages
 
-    def _complete(self, messages: list[dict[str, str]], model: str) -> str:
+    def _complete_with_groq(self, messages: list[dict[str, str]], model: str) -> str:
+        client = Groq(api_key=GROQ_API_KEY)
+        params = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.2,
+            "max_tokens": 800,
+            "top_p": 1,
+            "stream": False,
+        }
+        completion = client.chat.completions.create(**params)
+        content = completion.choices[0].message.content
+        return (content or "").strip()
+
+    def _complete_with_ollama(self, messages: list[dict[str, str]], model: str) -> str:
+        import urllib.request
+
         payload = {
             "model": model,
             "messages": messages,
             "temperature": 0.2,
             "max_tokens": 800,
         }
-        body = json.dumps(payload).encode("utf-8")
-
-        if GROQ_API_KEY:
-            headers = {
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            }
-            url = f"{GROQ_BASE_URL}/chat/completions"
-        else:
-            headers = {"Content-Type": "application/json"}
-            url = f"{OLLAMA_BASE_URL.rstrip('/')}/chat/completions"
-
-        import urllib.request
-        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        data = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        req = urllib.request.Request(
+            f"{OLLAMA_BASE_URL.rstrip('/')}/chat/completions",
+            data=data,
+            headers=headers,
+            method="POST",
+        )
         with urllib.request.urlopen(req, timeout=60) as response:
-            data = json.loads(response.read().decode("utf-8"))
-
-        if "choices" not in data or not data["choices"]:
-            raise RuntimeError("The model API returned no completion choices.")
-
-        msg = data["choices"][0].get("message", {})
-        content = msg.get("content") or msg.get("text") or ""
+            body = json.loads(response.read().decode("utf-8"))
+        if "choices" not in body or not body["choices"]:
+            raise RuntimeError("The Ollama API returned no completion choices.")
+        content = body["choices"][0].get("message", {}).get("content") or ""
         return str(content).strip()
 
     def answer_directly(self, user_input: str) -> str:
@@ -193,13 +201,16 @@ class Aura:
             self.memory.set_fact(key.strip(), value.strip())
             return f"Remembered: {key.strip()} = {value.strip()}"
 
-        model = GROQ_MODEL if GROQ_API_KEY else OLLAMA_MODEL
+        messages = self._build_messages(text)
+        if GROQ_API_KEY:
+            try:
+                return self._complete_with_groq(messages, GROQ_MODEL)
+            except Exception as exc:
+                return f"Model request failed: {exc}. Check GROQ_API_KEY or GROQ_MODEL."
         try:
-            messages = self._build_messages(text)
-            return self._complete(messages, model)
+            return self._complete_with_ollama(messages, OLLAMA_MODEL)
         except Exception as exc:
-            message = f"Model request failed: {exc}. Check GROQ_API_KEY/GROQ_MODEL or start Ollama."
-            return message
+            return f"Model request failed: {exc}. Start Ollama or set GROQ_API_KEY."
 
     def handle(self, user_input: str) -> str:
         return self.answer_directly(user_input)
