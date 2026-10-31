@@ -130,11 +130,9 @@ class Aura:
         return "\n".join(f"- {key}: {value}" for key, value in sorted(facts.items()))
 
     def _context_messages(self, user_input: str) -> list[dict[str, str]]:
-        history = self.memory.recent_history(limit=CONTEXT_MESSAGES)
-        trimmed = user_input.strip()
-        if not trimmed:
-            return history
-        return [*history, {"role": "user", "content": trimmed}]
+        # Only use recent history for context; do not append the current message
+        # here, otherwise the assistant keeps restating its own previous output.
+        return self.memory.recent_history(limit=CONTEXT_MESSAGES)
 
     def answer_directly(self, user_input: str) -> str:
         text = user_input.strip()
@@ -165,14 +163,14 @@ class Aura:
             self.memory.set_fact(key.strip(), value.strip())
             return f"Remembered: {key.strip()} = {value.strip()}"
 
-        user_context = self._context_messages(text)
-        if not user_context:
+        recent = self._context_messages(text)
+        if not recent:
             return "I’m ready to help."
 
-        summary = "\n".join(f"{msg['role']}: {msg['content']}" for msg in user_context)
+        summary = "\n".join(f"{msg['role']}: {msg['content']}" for msg in recent)
         return (
             "I can help with that. "
-            f"Context so far:\n{summary}\n\n"
+            f"Recent chat:\n{summary}\n\n"
             "If you want, ask me for a summary, a direct answer, or a rewrite."
         )
 
