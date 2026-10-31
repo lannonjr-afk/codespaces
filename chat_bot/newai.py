@@ -116,9 +116,7 @@ class SimpleMemory:
 class Aura:
     """Simple assistant wrapper that keeps a memory and returns helpful replies."""
 
-    COMMAND_HELP = (
-        "Commands: /help, /memory, /clear, /stats"
-    )
+    COMMAND_HELP = "Commands: /help, /memory, /clear, /stats"
 
     def __init__(self, memory: Optional[SimpleMemory] = None):
         self.memory = memory or SimpleMemory(DB_PATH)
@@ -130,9 +128,12 @@ class Aura:
         return "\n".join(f"- {key}: {value}" for key, value in sorted(facts.items()))
 
     def _context_messages(self, user_input: str) -> list[dict[str, str]]:
-        # Only use recent history for context; do not append the current message
-        # here, otherwise the assistant keeps restating its own previous output.
-        return self.memory.recent_history(limit=CONTEXT_MESSAGES)
+        # Keep only the most recent user turns in the conversational context.
+        # Excluding assistant replies prevents the bot from embedding its own
+        # prior summary text inside the next response.
+        history = self.memory.recent_history(limit=CONTEXT_MESSAGES * 2)
+        user_messages = [item for item in history if item["role"] == "user"]
+        return user_messages[-CONTEXT_MESSAGES:]
 
     def answer_directly(self, user_input: str) -> str:
         text = user_input.strip()
@@ -167,12 +168,9 @@ class Aura:
         if not recent:
             return "I’m ready to help."
 
-        summary = "\n".join(f"{msg['role']}: {msg['content']}" for msg in recent)
-        return (
-            "I can help with that. "
-            f"Recent chat:\n{summary}\n\n"
-            "If you want, ask me for a summary, a direct answer, or a rewrite."
-        )
+        # Keep the response short and avoid echoing the assistant's previous
+        # summary text back into the next turn.
+        return "I can help with that. Ask me a question."
 
     def handle(self, user_input: str) -> str:
         return self.answer_directly(user_input)
