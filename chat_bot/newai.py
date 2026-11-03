@@ -1,13 +1,14 @@
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
 from typing import Optional
 from uuid import uuid4
 
-from flask import Flask, g, jsonify, make_response, render_template, request
+from flask import Flask, g, jsonify, render_template, request
 from groq import Groq
 
 
@@ -24,12 +25,13 @@ GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", GROQ_MODEL)
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 DB_PATH = os.getenv("DB_PATH", "agent_memory.db")
 SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "aura_session")
-SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
+SESSION_TTL_SECONDS = max(60, int(os.getenv("SESSION_TTL_SECONDS", "86400")))
 
 CONTEXT_MESSAGES = 4
 MAX_INPUT_CHARS = 200_000
 MAX_HISTORY_CHARS = 75_000
 MAX_HISTORY_RECORDS = max(2, int(os.getenv("MAX_HISTORY_RECORDS", "2000")))
+MAX_HISTORY_RECORDS -= MAX_HISTORY_RECORDS % 2
 CHAT_RATE_LIMIT = max(1, int(os.getenv("CHAT_RATE_LIMIT", "12")))
 CHAT_RATE_WINDOW_SECONDS = max(1, int(os.getenv("CHAT_RATE_WINDOW_SECONDS", "60")))
 MAX_CONTENT_LENGTH_BYTES = 16 * 1024 * 1024
@@ -46,8 +48,7 @@ class SimpleMemory:
         self.db_path = str(db_path)
         self._lock = threading.RLock()
         if self.db_path != ":memory:":
-            parent = os.path.dirname(self.db_path) or "."
-            os.makedirs(parent, exist_ok=True)
+            os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         self.conn = sqlite3.connect(
             self.db_path, timeout=30, check_same_thread=False
         )
@@ -60,24 +61,20 @@ class SimpleMemory:
     def _create_tables(self) -> None:
         with self._lock:
             self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS facts (
+                """CREATE TABLE IF NOT EXISTS facts (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
+                )"""
             )
             self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS history (
+                """CREATE TABLE IF NOT EXISTS history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
                     meta TEXT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
+                )"""
             )
             self.conn.commit()
 
@@ -111,11 +108,11 @@ class SimpleMemory:
             self.conn.commit()
             return cursor.rowcount > 0
 
-    def _prune_history(self, keep: int) -> None:
+    def _prune_history(self) -> None:
         self.conn.execute(
             "DELETE FROM history WHERE id NOT IN "
             "(SELECT id FROM history ORDER BY id DESC LIMIT ?)",
-            (keep,),
+            (MAX_HISTORY_RECORDS,),
         )
 
     def add_history(self, role: str, content: str, meta: Optional[dict] = None) -> None:
@@ -124,18 +121,18 @@ class SimpleMemory:
                 "INSERT INTO history (role, content, meta) VALUES (?, ?, ?)",
                 (role, content, json.dumps(meta) if meta is not None else None),
             )
-            self._prune_history(MAX_HISTORY_RECORDS)
+            self._prune_history()
 
-    def record_exchange(self, user_text: str, assistant_text: str, meta: Optional[dict] = None) -> None:
+    def record_exchange(
+        self, user_text: str, assistant_text: str, meta: Optional[dict] = None
+    ) -> None:
         with self._lock, self.conn:
+            encoded_meta = json.dumps(meta) if meta is not None else None
             self.conn.executemany(
                 "INSERT INTO history (role, content, meta) VALUES (?, ?, ?)",
-                [
-                    ("user", user_text, json.dumps(meta) if meta is not None else None),
-                    ("assistant", assistant_text, json.dumps(meta) if meta is not None else None),
-                ],
+                [("user", user_text, encoded_meta), ("assistant", assistant_text, encoded_meta)],
             )
-            self._prune_history(MAX_HISTORY_RECORDS)
+            self._prune_history()
 
     def recent_history(self, limit: int = 10) -> list[dict[str, str]]:
         with self._lock:
@@ -155,13 +152,9 @@ class SimpleMemory:
 
     def stats(self) -> dict[str, int]:
         with self._lock:
-            fact_count = self.conn.execute(
-                "SELECT COUNT(*) FROM facts"
-            ).fetchone()[0]
-            history_count = self.conn.execute(
-                "SELECT COUNT(*) FROM history"
-            ).fetchone()[0]
-            return {"facts": fact_count, "history": history_count}
+            facts = self.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+            history = self.conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+            return {"facts": facts, "history": history}
 
     def close(self) -> None:
         with self._lock:
@@ -169,7 +162,7 @@ class SimpleMemory:
 
 
 class Aura:
-    """Assistant wrapper that keeps a small memory and recent conversation context."""
+    """Assistant wrapper that keeps a small amount of memory and recent context."""
 
     COMMAND_HELP = "Commands: /help, /memory, /clear, /stats, /remember key=value"
 
@@ -185,21 +178,32 @@ class Aura:
     def _context_messages(self) -> list[dict[str, str]]:
         history = self.memory.recent_history(limit=CONTEXT_MESSAGES * 2)
         selected = []
-        chars = 0
+        char_count = 0
         for item in reversed(history):
             if item["role"] not in {"user", "assistant"}:
                 continue
-            if selected and chars + len(item["content"]) > MAX_HISTORY_CHARS:
+            size = len(item["content"])
+            if selected and char_count + size > MAX_HISTORY_CHARS:
                 break
             selected.append(item)
-            chars += len(item["content"])
+            char_count += size
         return list(reversed(selected))
 
     def _build_messages(self, user_input: str) -> list[dict[str, str]]:
-        messages = [{"role": "system", "content": "You are AURA, a helpful assistant."}]
-        messages.extend(self._context_messages())
-        messages.append({"role": "user", "content": user_input})
-        return messages
+        system_prompt = (
+            "You are AURA, a helpful assistant. Answer the user's actual question "
+            "directly and concisely. Do not repeat previous greetings or unrelated "
+            "answers. Do not claim to have feelings or a real-world identity. "
+            "Never invent the user's name, identity, location, or personal details; "
+            "if you do not know, say so plainly. Do not volunteer the current date "
+            "or time, and never guess it. Only state a date or time if the user asks "
+            "and you have reliable current information."
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            *self._context_messages(),
+            {"role": "user", "content": user_input},
+        ]
 
     def _complete_with_groq(self, messages: list[dict[str, str]], model: str) -> str:
         client = Groq(api_key=GROQ_API_KEY, timeout=60, max_retries=0)
@@ -211,10 +215,10 @@ class Aura:
             top_p=1,
             stream=False,
         )
-        content = (completion.choices[0].message.content or "").strip()
-        if not content:
+        answer = (completion.choices[0].message.content or "").strip()
+        if not answer:
             raise RuntimeError("The provider returned an empty completion.")
-        return content
+        return answer
 
     def _complete_with_ollama(self, messages: list[dict[str, str]], model: str) -> str:
         import urllib.request
@@ -235,10 +239,10 @@ class Aura:
             body = json.loads(response.read().decode("utf-8"))
         if not body.get("choices"):
             raise RuntimeError("The Ollama API returned no completion choices.")
-        content = str(body["choices"][0].get("message", {}).get("content") or "").strip()
-        if not content:
+        answer = str(body["choices"][0].get("message", {}).get("content") or "").strip()
+        if not answer:
             raise RuntimeError("The provider returned an empty completion.")
-        return content
+        return answer
 
     def _complete(self, messages: list[dict[str, str]]) -> str:
         failures = []
@@ -251,7 +255,6 @@ class Aura:
             return self._complete_with_ollama(messages, OLLAMA_MODEL)
         except Exception as exc:
             failures.append(("Ollama", type(exc).__name__))
-
         LOGGER.warning(
             "All configured model providers failed: %s",
             ", ".join(f"{name} ({kind})" for name, kind in failures),
@@ -264,6 +267,17 @@ class Aura:
             return "Please provide a message."
         if len(text) > MAX_INPUT_CHARS:
             return f"Messages must be {MAX_INPUT_CHARS:,} characters or fewer."
+
+        normalized = re.sub(r"[!?.,]+$", "", text.casefold()).strip()
+        if normalized in {"hi", "hey", "hello", "good morning", "good afternoon", "good evening"}:
+            return "Hi! What can I help you with?"
+        if normalized in {"who are you", "what are you", "what is your name", "what's your name"}:
+            return "I'm AURA, an AI assistant. I can answer questions and help with tasks."
+        if normalized in {"who am i", "what is my name", "what's my name"}:
+            name = self.memory.get_fact("name")
+            if name:
+                return f"You told me your name is {name}."
+            return "I don't know your name or identity from this chat. You can tell me what you'd like me to call you."
 
         lowered = text.lower()
         if lowered in {"/help", "help"}:
@@ -285,7 +299,6 @@ class Aura:
                 return "Usage: /remember key=value"
             self.memory.set_fact(key.strip(), value.strip())
             return f"Remembered: {key.strip()} = {value.strip()}"
-
         return self._complete(self._build_messages(text))
 
     def handle(self, user_input: str) -> str:
@@ -294,11 +307,8 @@ class Aura:
     def answer_and_record(self, user_input: str, session_id: Optional[str] = None) -> str:
         answer = self.answer_directly(user_input)
         if user_input.strip().lower() not in {"/clear", "clear"}:
-            self.memory.record_exchange(
-                user_input.strip(),
-                answer,
-                meta={"session_id": session_id} if session_id else None,
-            )
+            meta = {"session_id": session_id} if session_id else None
+            self.memory.record_exchange(user_input.strip(), answer, meta=meta)
         return answer
 
     def run_command(self, text: str) -> bool:
@@ -311,44 +321,31 @@ class Aura:
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH_BYTES
-app.config["JSON_SORT_KEYS"] = False
 aura = Aura(memory=SimpleMemory(DB_PATH))
 _rate_lock = threading.Lock()
 _rate_events: dict[str, list[float]] = {}
 
 
-def get_or_create_session_id() -> str:
-    existing = request.cookies.get(SESSION_COOKIE_NAME)
-    if existing:
-        return existing
-    session_id = uuid4().hex
-    response = make_response()
-    response.set_cookie(
-        SESSION_COOKIE_NAME,
-        session_id,
-        max_age=SESSION_TTL_SECONDS,
-        httponly=True,
-        samesite="Lax",
-        secure=request.is_secure,
-    )
-    g.session_cookie_response = response
-    return session_id
-
-
 @app.before_request
 def bind_request_context():
     g.request_id = uuid4().hex
-    g.session_id = get_or_create_session_id()
-    if hasattr(g, "session_cookie_response"):
-        response = g.session_cookie_response
-        g.session_cookie_response = None
-        return response
-    return None
+    supplied_id = request.cookies.get(SESSION_COOKIE_NAME, "")
+    g.session_id = supplied_id if re.fullmatch(r"[a-f0-9]{32}", supplied_id) else uuid4().hex
+    g.set_session_cookie = g.session_id != supplied_id
 
 
 @app.after_request
-def add_request_headers(response):
-    response.headers["X-Request-ID"] = g.request_id
+def add_response_headers(response):
+    response.headers["X-Request-ID"] = getattr(g, "request_id", uuid4().hex)
+    if getattr(g, "set_session_cookie", False):
+        response.set_cookie(
+            SESSION_COOKIE_NAME,
+            g.session_id,
+            max_age=SESSION_TTL_SECONDS,
+            httponly=True,
+            samesite="Lax",
+            secure=request.is_secure,
+        )
     return response
 
 
@@ -356,7 +353,6 @@ def add_request_headers(response):
 def limit_chat_requests():
     if request.endpoint != "chat" or request.method != "POST":
         return None
-
     now = time.monotonic()
     client = request.remote_addr or "unknown"
     cutoff = now - CHAT_RATE_WINDOW_SECONDS
@@ -371,7 +367,6 @@ def limit_chat_requests():
         if len(events) >= CHAT_RATE_LIMIT:
             return jsonify({"error": "Too many requests. Please wait and try again."}), 429
         events.append(now)
-    return None
 
 
 @app.route("/")
@@ -387,12 +382,7 @@ def healthz():
 @app.route("/api/stats")
 def stats_api():
     stats = aura.memory.stats()
-    return jsonify({
-        "status": "ok",
-        "facts": stats["facts"],
-        "history": stats["history"],
-        "session_id": g.session_id,
-    })
+    return jsonify({"status": "ok", **stats})
 
 
 @app.route("/api/chat", methods=["POST"])
@@ -408,13 +398,13 @@ def chat():
         return jsonify({"error": f"Message must be {MAX_INPUT_CHARS:,} characters or fewer."}), 413
 
     try:
-        response = aura.answer_and_record(user_input, session_id=g.session_id)
+        answer = aura.answer_and_record(user_input, session_id=g.session_id)
     except ModelUnavailable:
         return jsonify({"error": "The model service is temporarily unavailable."}), 503
     except Exception:
-        app.logger.exception("Chat request failed")
+        app.logger.exception("Chat request failed; request_id=%s", g.request_id)
         return jsonify({"error": "The chat service could not complete this request."}), 502
-    return jsonify({"response": response})
+    return jsonify({"response": answer})
 
 
 @app.errorhandler(413)
