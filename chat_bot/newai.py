@@ -4,27 +4,35 @@ import os
 import sqlite3
 import threading
 import time
-from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, g, jsonify, make_response, render_template, request
 from groq import Groq
 
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+LOGGER = logging.getLogger("aura")
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", GROQ_MODEL)
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 DB_PATH = os.getenv("DB_PATH", "agent_memory.db")
+SESSION_COOKIE_NAME = os.getenv("SESSION_COOKIE_NAME", "aura_session")
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
+
 CONTEXT_MESSAGES = 4
 MAX_INPUT_CHARS = 200_000
 MAX_HISTORY_CHARS = 75_000
 MAX_HISTORY_RECORDS = max(2, int(os.getenv("MAX_HISTORY_RECORDS", "2000")))
-MAX_HISTORY_RECORDS -= MAX_HISTORY_RECORDS % 2  # retain complete user/assistant turns
 CHAT_RATE_LIMIT = max(1, int(os.getenv("CHAT_RATE_LIMIT", "12")))
 CHAT_RATE_WINDOW_SECONDS = max(1, int(os.getenv("CHAT_RATE_WINDOW_SECONDS", "60")))
 MAX_CONTENT_LENGTH_BYTES = 16 * 1024 * 1024
-LOGGER = logging.getLogger(__name__)
 
 
 class ModelUnavailable(RuntimeError):
@@ -38,9 +46,8 @@ class SimpleMemory:
         self.db_path = str(db_path)
         self._lock = threading.RLock()
         if self.db_path != ":memory:":
-            Path(self.db_path).expanduser().resolve().parent.mkdir(
-                parents=True, exist_ok=True
-            )
+            parent = os.path.dirname(self.db_path) or "."
+            os.makedirs(parent, exist_ok=True)
         self.conn = sqlite3.connect(
             self.db_path, timeout=30, check_same_thread=False
         )
@@ -104,8 +111,14 @@ class SimpleMemory:
             self.conn.commit()
             return cursor.rowcount > 0
 
+    def _prune_history(self, keep: int) -> None:
+        self.conn.execute(
+            "DELETE FROM history WHERE id NOT IN "
+            "(SELECT id FROM history ORDER BY id DESC LIMIT ?)",
+            (keep,),
+        )
+
     def add_history(self, role: str, content: str, meta: Optional[dict] = None) -> None:
-        """Add a history record and enforce the configured storage cap."""
         with self._lock, self.conn:
             self.conn.execute(
                 "INSERT INTO history (role, content, meta) VALUES (?, ?, ?)",
@@ -113,21 +126,16 @@ class SimpleMemory:
             )
             self._prune_history(MAX_HISTORY_RECORDS)
 
-    def record_exchange(self, user_text: str, assistant_text: str) -> None:
-        """Persist a complete turn atomically, retaining only whole turns."""
+    def record_exchange(self, user_text: str, assistant_text: str, meta: Optional[dict] = None) -> None:
         with self._lock, self.conn:
             self.conn.executemany(
-                "INSERT INTO history (role, content) VALUES (?, ?)",
-                [("user", user_text), ("assistant", assistant_text)],
+                "INSERT INTO history (role, content, meta) VALUES (?, ?, ?)",
+                [
+                    ("user", user_text, json.dumps(meta) if meta is not None else None),
+                    ("assistant", assistant_text, json.dumps(meta) if meta is not None else None),
+                ],
             )
             self._prune_history(MAX_HISTORY_RECORDS)
-
-    def _prune_history(self, keep: int) -> None:
-        self.conn.execute(
-            "DELETE FROM history WHERE id NOT IN "
-            "(SELECT id FROM history ORDER BY id DESC LIMIT ?)",
-            (keep,),
-        )
 
     def recent_history(self, limit: int = 10) -> list[dict[str, str]]:
         with self._lock:
@@ -161,7 +169,7 @@ class SimpleMemory:
 
 
 class Aura:
-    """Assistant wrapper that keeps a small amount of memory and chat history."""
+    """Assistant wrapper that keeps a small memory and recent conversation context."""
 
     COMMAND_HELP = "Commands: /help, /memory, /clear, /stats, /remember key=value"
 
@@ -175,18 +183,16 @@ class Aura:
         return "\n".join(f"- {key}: {value}" for key, value in sorted(facts.items()))
 
     def _context_messages(self) -> list[dict[str, str]]:
-        """Return recent user/assistant turns within the context character budget."""
         history = self.memory.recent_history(limit=CONTEXT_MESSAGES * 2)
         selected = []
-        characters = 0
+        chars = 0
         for item in reversed(history):
-            size = len(item["content"])
-            if selected and characters + size > MAX_HISTORY_CHARS:
-                break
             if item["role"] not in {"user", "assistant"}:
                 continue
+            if selected and chars + len(item["content"]) > MAX_HISTORY_CHARS:
+                break
             selected.append(item)
-            characters += size
+            chars += len(item["content"])
         return list(reversed(selected))
 
     def _build_messages(self, user_input: str) -> list[dict[str, str]]:
@@ -240,17 +246,15 @@ class Aura:
             try:
                 return self._complete_with_groq(messages, GROQ_MODEL)
             except Exception as exc:
-                failures.append(("Groq", exc))
+                failures.append(("Groq", type(exc).__name__))
         try:
             return self._complete_with_ollama(messages, OLLAMA_MODEL)
         except Exception as exc:
-            failures.append(("Ollama", exc))
+            failures.append(("Ollama", type(exc).__name__))
 
-        # Keep provider details (which may contain sensitive request metadata) out
-        # of the HTTP response and logs; report provider names and exception types.
         LOGGER.warning(
             "All configured model providers failed: %s",
-            ", ".join(f"{name} ({type(exc).__name__})" for name, exc in failures),
+            ", ".join(f"{name} ({kind})" for name, kind in failures),
         )
         raise ModelUnavailable("The model service is temporarily unavailable.") from None
 
@@ -281,16 +285,20 @@ class Aura:
                 return "Usage: /remember key=value"
             self.memory.set_fact(key.strip(), value.strip())
             return f"Remembered: {key.strip()} = {value.strip()}"
+
         return self._complete(self._build_messages(text))
 
     def handle(self, user_input: str) -> str:
         return self.answer_directly(user_input)
 
-    def answer_and_record(self, user_input: str) -> str:
+    def answer_and_record(self, user_input: str, session_id: Optional[str] = None) -> str:
         answer = self.answer_directly(user_input)
-        # Do not recreate history immediately after the user requested its deletion.
         if user_input.strip().lower() not in {"/clear", "clear"}:
-            self.memory.record_exchange(user_input.strip(), answer)
+            self.memory.record_exchange(
+                user_input.strip(),
+                answer,
+                meta={"session_id": session_id} if session_id else None,
+            )
         return answer
 
     def run_command(self, text: str) -> bool:
@@ -303,9 +311,45 @@ class Aura:
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH_BYTES
+app.config["JSON_SORT_KEYS"] = False
 aura = Aura(memory=SimpleMemory(DB_PATH))
 _rate_lock = threading.Lock()
 _rate_events: dict[str, list[float]] = {}
+
+
+def get_or_create_session_id() -> str:
+    existing = request.cookies.get(SESSION_COOKIE_NAME)
+    if existing:
+        return existing
+    session_id = uuid4().hex
+    response = make_response()
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        session_id,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="Lax",
+        secure=request.is_secure,
+    )
+    g.session_cookie_response = response
+    return session_id
+
+
+@app.before_request
+def bind_request_context():
+    g.request_id = uuid4().hex
+    g.session_id = get_or_create_session_id()
+    if hasattr(g, "session_cookie_response"):
+        response = g.session_cookie_response
+        g.session_cookie_response = None
+        return response
+    return None
+
+
+@app.after_request
+def add_request_headers(response):
+    response.headers["X-Request-ID"] = g.request_id
+    return response
 
 
 @app.before_request
@@ -317,7 +361,6 @@ def limit_chat_requests():
     client = request.remote_addr or "unknown"
     cutoff = now - CHAT_RATE_WINDOW_SECONDS
     with _rate_lock:
-        # Expire old clients as well as old events to keep this process-local map bounded.
         for address, stamps in list(_rate_events.items()):
             active = [stamp for stamp in stamps if stamp > cutoff]
             if active:
@@ -341,6 +384,17 @@ def healthz():
     return jsonify({"status": "ok"})
 
 
+@app.route("/api/stats")
+def stats_api():
+    stats = aura.memory.stats()
+    return jsonify({
+        "status": "ok",
+        "facts": stats["facts"],
+        "history": stats["history"],
+        "session_id": g.session_id,
+    })
+
+
 @app.route("/api/chat", methods=["POST"])
 def chat():
     payload = request.get_json(silent=True)
@@ -354,7 +408,7 @@ def chat():
         return jsonify({"error": f"Message must be {MAX_INPUT_CHARS:,} characters or fewer."}), 413
 
     try:
-        response = aura.answer_and_record(user_input)
+        response = aura.answer_and_record(user_input, session_id=g.session_id)
     except ModelUnavailable:
         return jsonify({"error": "The model service is temporarily unavailable."}), 503
     except Exception:
