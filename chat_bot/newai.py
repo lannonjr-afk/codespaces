@@ -1,7 +1,10 @@
 import json
+import logging
 import os
 import sqlite3
 import threading
+import time
+from pathlib import Path
 from typing import Optional
 
 from flask import Flask, jsonify, render_template, request
@@ -15,18 +18,29 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 DB_PATH = os.getenv("DB_PATH", "agent_memory.db")
 CONTEXT_MESSAGES = 4
 MAX_INPUT_CHARS = 200_000
-MAX_HISTORY_RECORDS = max(100, int(os.getenv("MAX_HISTORY_RECORDS", "2000")))
+MAX_HISTORY_CHARS = 75_000
+MAX_HISTORY_RECORDS = max(2, int(os.getenv("MAX_HISTORY_RECORDS", "2000")))
+MAX_HISTORY_RECORDS -= MAX_HISTORY_RECORDS % 2  # retain complete user/assistant turns
 CHAT_RATE_LIMIT = max(1, int(os.getenv("CHAT_RATE_LIMIT", "12")))
 CHAT_RATE_WINDOW_SECONDS = max(1, int(os.getenv("CHAT_RATE_WINDOW_SECONDS", "60")))
 MAX_CONTENT_LENGTH_BYTES = 16 * 1024 * 1024
+LOGGER = logging.getLogger(__name__)
+
+
+class ModelUnavailable(RuntimeError):
+    """Raised when no configured language-model provider can answer."""
 
 
 class SimpleMemory:
     """SQLite-backed memory with serialized access and bounded chat history."""
 
     def __init__(self, db_path: str = DB_PATH):
-        self.db_path = db_path
+        self.db_path = str(db_path)
         self._lock = threading.RLock()
+        if self.db_path != ":memory:":
+            Path(self.db_path).expanduser().resolve().parent.mkdir(
+                parents=True, exist_ok=True
+            )
         self.conn = sqlite3.connect(
             self.db_path, timeout=30, check_same_thread=False
         )
@@ -91,17 +105,29 @@ class SimpleMemory:
             return cursor.rowcount > 0
 
     def add_history(self, role: str, content: str, meta: Optional[dict] = None) -> None:
-        with self._lock:
+        """Add a history record and enforce the configured storage cap."""
+        with self._lock, self.conn:
             self.conn.execute(
                 "INSERT INTO history (role, content, meta) VALUES (?, ?, ?)",
                 (role, content, json.dumps(meta) if meta is not None else None),
             )
-            self.conn.execute(
-                "DELETE FROM history WHERE id NOT IN "
-                "(SELECT id FROM history ORDER BY id DESC LIMIT ?)",
-                (MAX_HISTORY_RECORDS,),
+            self._prune_history(MAX_HISTORY_RECORDS)
+
+    def record_exchange(self, user_text: str, assistant_text: str) -> None:
+        """Persist a complete turn atomically, retaining only whole turns."""
+        with self._lock, self.conn:
+            self.conn.executemany(
+                "INSERT INTO history (role, content) VALUES (?, ?)",
+                [("user", user_text), ("assistant", assistant_text)],
             )
-            self.conn.commit()
+            self._prune_history(MAX_HISTORY_RECORDS)
+
+    def _prune_history(self, keep: int) -> None:
+        self.conn.execute(
+            "DELETE FROM history WHERE id NOT IN "
+            "(SELECT id FROM history ORDER BY id DESC LIMIT ?)",
+            (keep,),
+        )
 
     def recent_history(self, limit: int = 10) -> list[dict[str, str]]:
         with self._lock:
@@ -115,9 +141,8 @@ class SimpleMemory:
             ]
 
     def clear_history(self) -> int:
-        with self._lock:
+        with self._lock, self.conn:
             cursor = self.conn.execute("DELETE FROM history")
-            self.conn.commit()
             return cursor.rowcount
 
     def stats(self) -> dict[str, int]:
@@ -149,24 +174,29 @@ class Aura:
             return "No remembered facts."
         return "\n".join(f"- {key}: {value}" for key, value in sorted(facts.items()))
 
-    def _context_messages(self, user_input: str) -> list[dict[str, str]]:
+    def _context_messages(self) -> list[dict[str, str]]:
+        """Return recent user/assistant turns within the context character budget."""
         history = self.memory.recent_history(limit=CONTEXT_MESSAGES * 2)
-        user_messages = [item for item in history if item["role"] == "user"]
-        if user_input and user_input.strip():
-            user_messages = [
-                item for item in user_messages
-                if item["content"].strip() != user_input.strip()
-            ]
-        return user_messages[-CONTEXT_MESSAGES:]
+        selected = []
+        characters = 0
+        for item in reversed(history):
+            size = len(item["content"])
+            if selected and characters + size > MAX_HISTORY_CHARS:
+                break
+            if item["role"] not in {"user", "assistant"}:
+                continue
+            selected.append(item)
+            characters += size
+        return list(reversed(selected))
 
     def _build_messages(self, user_input: str) -> list[dict[str, str]]:
         messages = [{"role": "system", "content": "You are AURA, a helpful assistant."}]
-        messages.extend(self._context_messages(user_input))
+        messages.extend(self._context_messages())
         messages.append({"role": "user", "content": user_input})
         return messages
 
     def _complete_with_groq(self, messages: list[dict[str, str]], model: str) -> str:
-        client = Groq(api_key=GROQ_API_KEY)
+        client = Groq(api_key=GROQ_API_KEY, timeout=60, max_retries=0)
         completion = client.chat.completions.create(
             model=model,
             messages=messages,
@@ -175,7 +205,10 @@ class Aura:
             top_p=1,
             stream=False,
         )
-        return (completion.choices[0].message.content or "").strip()
+        content = (completion.choices[0].message.content or "").strip()
+        if not content:
+            raise RuntimeError("The provider returned an empty completion.")
+        return content
 
     def _complete_with_ollama(self, messages: list[dict[str, str]], model: str) -> str:
         import urllib.request
@@ -196,8 +229,10 @@ class Aura:
             body = json.loads(response.read().decode("utf-8"))
         if not body.get("choices"):
             raise RuntimeError("The Ollama API returned no completion choices.")
-        content = body["choices"][0].get("message", {}).get("content") or ""
-        return str(content).strip()
+        content = str(body["choices"][0].get("message", {}).get("content") or "").strip()
+        if not content:
+            raise RuntimeError("The provider returned an empty completion.")
+        return content
 
     def _complete(self, messages: list[dict[str, str]]) -> str:
         failures = []
@@ -205,12 +240,19 @@ class Aura:
             try:
                 return self._complete_with_groq(messages, GROQ_MODEL)
             except Exception as exc:
-                failures.append(f"Groq: {exc}")
+                failures.append(("Groq", exc))
         try:
             return self._complete_with_ollama(messages, OLLAMA_MODEL)
         except Exception as exc:
-            failures.append(f"Ollama: {exc}")
-        return "Model request failed. Check the configured provider and model. " + "; ".join(failures)
+            failures.append(("Ollama", exc))
+
+        # Keep provider details (which may contain sensitive request metadata) out
+        # of the HTTP response and logs; report provider names and exception types.
+        LOGGER.warning(
+            "All configured model providers failed: %s",
+            ", ".join(f"{name} ({type(exc).__name__})" for name, exc in failures),
+        )
+        raise ModelUnavailable("The model service is temporarily unavailable.") from None
 
     def answer_directly(self, user_input: str) -> str:
         text = (user_input or "").strip()
@@ -246,12 +288,10 @@ class Aura:
 
     def answer_and_record(self, user_input: str) -> str:
         answer = self.answer_directly(user_input)
-        self._record(user_input, answer)
+        # Do not recreate history immediately after the user requested its deletion.
+        if user_input.strip().lower() not in {"/clear", "clear"}:
+            self.memory.record_exchange(user_input.strip(), answer)
         return answer
-
-    def _record(self, user_input: str, answer: str, meta: Optional[dict] = None) -> None:
-        self.memory.add_history("user", user_input.strip(), meta)
-        self.memory.add_history("assistant", answer, meta)
 
     def run_command(self, text: str) -> bool:
         text = text.strip()
@@ -270,19 +310,24 @@ _rate_events: dict[str, list[float]] = {}
 
 @app.before_request
 def limit_chat_requests():
-    if request.endpoint != "chat":
+    if request.endpoint != "chat" or request.method != "POST":
         return None
-    import time
 
     now = time.monotonic()
     client = request.remote_addr or "unknown"
     cutoff = now - CHAT_RATE_WINDOW_SECONDS
     with _rate_lock:
-        events = [stamp for stamp in _rate_events.get(client, []) if stamp > cutoff]
+        # Expire old clients as well as old events to keep this process-local map bounded.
+        for address, stamps in list(_rate_events.items()):
+            active = [stamp for stamp in stamps if stamp > cutoff]
+            if active:
+                _rate_events[address] = active
+            else:
+                _rate_events.pop(address, None)
+        events = _rate_events.setdefault(client, [])
         if len(events) >= CHAT_RATE_LIMIT:
             return jsonify({"error": "Too many requests. Please wait and try again."}), 429
         events.append(now)
-        _rate_events[client] = events
     return None
 
 
@@ -301,14 +346,17 @@ def chat():
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify({"error": "Request body must be valid JSON."}), 400
-    user_input = str(payload.get("message", "")).strip()
-    if not user_input:
-        return jsonify({"error": "Message is required."}), 400
+    user_input = payload.get("message")
+    if not isinstance(user_input, str) or not user_input.strip():
+        return jsonify({"error": "Message is required and must be text."}), 400
+    user_input = user_input.strip()
     if len(user_input) > MAX_INPUT_CHARS:
         return jsonify({"error": f"Message must be {MAX_INPUT_CHARS:,} characters or fewer."}), 413
 
     try:
         response = aura.answer_and_record(user_input)
+    except ModelUnavailable:
+        return jsonify({"error": "The model service is temporarily unavailable."}), 503
     except Exception:
         app.logger.exception("Chat request failed")
         return jsonify({"error": "The chat service could not complete this request."}), 502
