@@ -42,14 +42,14 @@ class ModelUnavailable(RuntimeError):
     """Raised when no configured language-model provider can answer."""
 
 
-def current_utc_time() -> datetime:
-    """Return the current timezone-aware UTC time for factual date/time answers."""
+def current_gmt_time() -> datetime:
+    """Return the current timezone-aware GMT time (UTC offset +00:00)."""
     return datetime.now(timezone.utc)
 
 
-def format_utc_date(value: datetime) -> str:
+def format_gmt_date(value: datetime) -> str:
     """Format a date without platform-specific strftime directives."""
-    return f"{value:%A, %B} {value.day}, {value:%Y} UTC"
+    return f"{value:%A, %B} {value.day}, {value:%Y} GMT"
 
 
 class SimpleMemory:
@@ -204,15 +204,15 @@ class Aura:
         return list(reversed(selected))
 
     def _build_messages(self, user_input: str) -> list[dict[str, str]]:
-        now = current_utc_time()
+        now = current_gmt_time()
         system_prompt = (
             "You are AURA, a helpful assistant. Answer the user's actual question "
             "directly and concisely. Do not repeat previous greetings or unrelated "
             "answers. Do not claim to have feelings or a real-world identity. "
             "Never invent the user's name, identity, location, or personal details; "
             "if you do not know, say so plainly. The current date and time are "
-            f"{now.isoformat(timespec='seconds')} (UTC). Use this as the reliable "
-            "current date/time when asked, and state that it is UTC unless the user "
+            f"{now.isoformat(timespec='seconds')} (GMT). Use this as the reliable "
+            "current date/time when asked, and state that it is GMT unless the user "
             "has specified a different timezone. Do not guess the user's local time."
         )
         return [
@@ -315,9 +315,9 @@ class Aura:
                 return f"You told me your name is {remembered_name}."
             return "I don’t know your name yet. You can tell me what to call you."
         if question in {"what day is it", "what date is it", "what is todays date", "whats todays date", "what is the date today", "what date is it today"}:
-            return f"Today is {format_utc_date(current_utc_time())}."
+            return f"Today is {format_gmt_date(current_gmt_time())}."
         if question in {"what time is it", "what is the time", "whats the time", "current time"}:
-            return f"The current time is {current_utc_time():%H:%M} UTC."
+            return f"The current time is {current_gmt_time():%H:%M} GMT."
 
         lowered = text.lower()
         if lowered in {"/help", "help"}:
