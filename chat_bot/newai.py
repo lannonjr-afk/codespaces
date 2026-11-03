@@ -130,7 +130,10 @@ class SimpleMemory:
             encoded_meta = json.dumps(meta) if meta is not None else None
             self.conn.executemany(
                 "INSERT INTO history (role, content, meta) VALUES (?, ?, ?)",
-                [("user", user_text, encoded_meta), ("assistant", assistant_text, encoded_meta)],
+                [
+                    ("user", user_text, encoded_meta),
+                    ("assistant", assistant_text, encoded_meta),
+                ],
             )
             self._prune_history()
 
@@ -261,6 +264,21 @@ class Aura:
         )
         raise ModelUnavailable("The model service is temporarily unavailable.") from None
 
+    def _remember_name_if_mentioned(self, text: str) -> Optional[str]:
+        patterns = [
+            r"\bmy name is\s+([A-Za-z][A-Za-z' -]{1,40})",
+            r"\bi\s+am\s+([A-Za-z][A-Za-z' -]{1,40})",
+            r"\bi'm\s+([A-Za-z][A-Za-z' -]{1,40})",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                candidate = match.group(1).strip()
+                if candidate and candidate.lower() not in {"aura", "assistant", "ai"}:
+                    self.memory.set_fact("name", candidate)
+                    return candidate
+        return None
+
     def answer_directly(self, user_input: str) -> str:
         text = (user_input or "").strip()
         if not text:
@@ -268,16 +286,23 @@ class Aura:
         if len(text) > MAX_INPUT_CHARS:
             return f"Messages must be {MAX_INPUT_CHARS:,} characters or fewer."
 
-        normalized = re.sub(r"[!?.,]+$", "", text.casefold()).strip()
-        if normalized in {"hi", "hey", "hello", "good morning", "good afternoon", "good evening"}:
-            return "Hi! What can I help you with?"
-        if normalized in {"who are you", "what are you", "what is your name", "what's your name"}:
-            return "I'm AURA, an AI assistant. I can answer questions and help with tasks."
-        if normalized in {"who am i", "what is my name", "what's my name"}:
+        remembered_name = self.memory.get_fact("name")
+        if self._remember_name_if_mentioned(text):
             name = self.memory.get_fact("name")
-            if name:
-                return f"You told me your name is {name}."
-            return "I don't know your name or identity from this chat. You can tell me what you'd like me to call you."
+            return f"Nice to meet you, {name}. I’ll remember that."
+
+        normalized = re.sub(r"[^a-z0-9\s]", " ", text.casefold()).strip()
+        greeting = " ".join(normalized.split())
+        if greeting in {"hi", "hey", "hello", "good morning", "good afternoon", "good evening"}:
+            return "Hi! What can I help you with?"
+        if greeting in {"who are you", "what are you", "what is your name", "whats your name"}:
+            return "I’m AURA, an AI assistant. I can answer questions and help with tasks."
+        if greeting in {"who am i", "what is my name", "whats my name"}:
+            if remembered_name:
+                return f"You told me your name is {remembered_name}."
+            return "I don’t know your name yet. You can tell me what to call you."
+        if greeting in {"what day is it", "what date is it"}:
+            return "I don’t track the real-world date unless you ask for a specific date or calendar tool."
 
         lowered = text.lower()
         if lowered in {"/help", "help"}:
@@ -321,6 +346,7 @@ class Aura:
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH_BYTES
+app.config["JSON_SORT_KEYS"] = False
 aura = Aura(memory=SimpleMemory(DB_PATH))
 _rate_lock = threading.Lock()
 _rate_events: dict[str, list[float]] = {}
@@ -367,6 +393,7 @@ def limit_chat_requests():
         if len(events) >= CHAT_RATE_LIMIT:
             return jsonify({"error": "Too many requests. Please wait and try again."}), 429
         events.append(now)
+    return None
 
 
 @app.route("/")
