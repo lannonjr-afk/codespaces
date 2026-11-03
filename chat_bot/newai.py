@@ -5,6 +5,7 @@ import re
 import sqlite3
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
@@ -39,6 +40,16 @@ MAX_CONTENT_LENGTH_BYTES = 16 * 1024 * 1024
 
 class ModelUnavailable(RuntimeError):
     """Raised when no configured language-model provider can answer."""
+
+
+def current_utc_time() -> datetime:
+    """Return the current timezone-aware UTC time for factual date/time answers."""
+    return datetime.now(timezone.utc)
+
+
+def format_utc_date(value: datetime) -> str:
+    """Format a date without platform-specific strftime directives."""
+    return f"{value:%A, %B} {value.day}, {value:%Y} UTC"
 
 
 class SimpleMemory:
@@ -193,14 +204,16 @@ class Aura:
         return list(reversed(selected))
 
     def _build_messages(self, user_input: str) -> list[dict[str, str]]:
+        now = current_utc_time()
         system_prompt = (
             "You are AURA, a helpful assistant. Answer the user's actual question "
             "directly and concisely. Do not repeat previous greetings or unrelated "
             "answers. Do not claim to have feelings or a real-world identity. "
             "Never invent the user's name, identity, location, or personal details; "
-            "if you do not know, say so plainly. Do not volunteer the current date "
-            "or time, and never guess it. Only state a date or time if the user asks "
-            "and you have reliable current information."
+            "if you do not know, say so plainly. The current date and time are "
+            f"{now.isoformat(timespec='seconds')} (UTC). Use this as the reliable "
+            "current date/time when asked, and state that it is UTC unless the user "
+            "has specified a different timezone. Do not guess the user's local time."
         )
         return [
             {"role": "system", "content": system_prompt},
@@ -292,17 +305,19 @@ class Aura:
             return f"Nice to meet you, {name}. I’ll remember that."
 
         normalized = re.sub(r"[^a-z0-9\s]", " ", text.casefold()).strip()
-        greeting = " ".join(normalized.split())
-        if greeting in {"hi", "hey", "hello", "good morning", "good afternoon", "good evening"}:
+        question = " ".join(normalized.split())
+        if question in {"hi", "hey", "hello", "good morning", "good afternoon", "good evening"}:
             return "Hi! What can I help you with?"
-        if greeting in {"who are you", "what are you", "what is your name", "whats your name"}:
+        if question in {"who are you", "what are you", "what is your name", "whats your name"}:
             return "I’m AURA, an AI assistant. I can answer questions and help with tasks."
-        if greeting in {"who am i", "what is my name", "whats my name"}:
+        if question in {"who am i", "what is my name", "whats my name"}:
             if remembered_name:
                 return f"You told me your name is {remembered_name}."
             return "I don’t know your name yet. You can tell me what to call you."
-        if greeting in {"what day is it", "what date is it"}:
-            return "I don’t track the real-world date unless you ask for a specific date or calendar tool."
+        if question in {"what day is it", "what date is it", "what is todays date", "whats todays date", "what is the date today", "what date is it today"}:
+            return f"Today is {format_utc_date(current_utc_time())}."
+        if question in {"what time is it", "what is the time", "whats the time", "current time"}:
+            return f"The current time is {current_utc_time():%H:%M} UTC."
 
         lowered = text.lower()
         if lowered in {"/help", "help"}:
@@ -393,7 +408,6 @@ def limit_chat_requests():
         if len(events) >= CHAT_RATE_LIMIT:
             return jsonify({"error": "Too many requests. Please wait and try again."}), 429
         events.append(now)
-    return None
 
 
 @app.route("/")
