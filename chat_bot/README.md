@@ -3,55 +3,50 @@
 ## Deploy to Render
 
 1. Push this repository to GitHub and create a Render Blueprint from it. Render
-   will use the root `render.yaml` to build and start the web service.
-2. When prompted, set `GROQ_API_KEY` to a Groq API key.
+   uses the root `render.yaml` to build and start the web service.
+2. Set `GROQ_API_KEY` to a Groq API key.
 3. Open the service URL and start chatting.
 
-The web app is public and does not require a login. Anyone with the service URL
-can use it and send requests to the chat API.
+The web app is public and does not require login. Anyone with the service URL can
+send requests to the chat API. It applies a per-process limit of 12 chat requests
+per client IP per 60 seconds by default (`CHAT_RATE_LIMIT` and
+`CHAT_RATE_WINDOW_SECONDS` configure this). This in-process limit is not shared
+between Gunicorn workers or instances; use a reverse-proxy or shared rate-limit
+store for stronger production abuse controls. Configure trusted proxy handling
+before relying on forwarded client IP headers.
+
+Conversation messages and assistant replies are stored in SQLite. Avoid entering
+sensitive information. History is capped at 2,000 records by default and older
+records are pruned as new entries are added (`MAX_HISTORY_RECORDS` changes the
+limit). The `/clear` command clears stored chat history. The SQLite database is
+not encrypted.
 
 The service uses Groq's OpenAI-compatible API and defaults to
-`openai/gpt-oss-120b`. Set `GROQ_MODEL` in Render to choose another model
-available to your account. The local command-line mode continues to use Ollama
-when `GROQ_API_KEY` is unset.
-YouTube subscriber questions read the channel's public YouTube page and do not
-require an API key. Use a channel handle or channel URL for the most reliable
-match. A display name is searched; if AURA cannot identify an exact match, it
-asks you to select a channel. Counts are displayed as YouTube presents them
-(often rounded), with the channel source and UTC check time. This page-based
-lookup may stop working if YouTube changes its page format or blocks automated
-requests.
+`llama-3.3-70b-versatile`. Set `GROQ_MODEL` to choose another model. If Groq is
+configured but unavailable, AURA attempts the configured Ollama endpoint as a
+fallback. Without `GROQ_API_KEY`, it uses Ollama directly; configure
+`OLLAMA_BASE_URL` and `OLLAMA_MODEL` as needed.
 
-The chat page accepts multiple text and code files, CSV, XLSX, DOCX, text-based
-PDF, and PNG/JPEG/WEBP images (up to 5 MB total per request). Files are read for
-that request and are not saved. Scanned or password-protected PDFs are not
-supported. Extracted text is limited to 100,000 characters per file. Text
-attachments longer than 6,000 characters are analyzed in overlapping chunks
-and combined into a final answer, using multiple model requests. Image questions
-require setting `GROQ_VISION_MODEL` in the Render service environment to a
-vision-capable model available to your account; text questions continue using
-`GROQ_MODEL`.
-
-The Blueprint uses Render's free web-service plan, so the SQLite conversation
-history is on ephemeral storage and can be lost when the service restarts or
-redeploys. For durable memory, use a paid Render plan with a persistent disk,
-mount it at `/var/data`, and set `DB_PATH` to
-`/var/data/agent_memory.db`.
+The service worker caches only the same-origin app shell and static files. It
+does not cache chat API responses. The interface displays an offline notice;
+sending chat messages still requires a network connection.
 
 ## Run locally
 
-Install the requirements and run the existing CLI with Ollama:
+Install requirements and run the CLI with Ollama:
 
 ```sh
 python -m pip install -r requirements.txt
 python newai.py
 ```
 
-To run the web app locally, set `GROQ_API_KEY`, then run:
+To run the web app locally:
 
 ```sh
 gunicorn newai:app
 ```
 
-The web app can instead use a reachable Ollama server when `GROQ_API_KEY` is
-unset. Set `OLLAMA_BASE_URL` and optionally `OLLAMA_MODEL` for that setup.
+The Render Blueprint uses a free web-service plan, so SQLite data is on
+(ephemeral storage and can be lost when the service restarts or redeploys. For
+durable storage, use a persistent disk and set `DB_PATH` to a file on that disk.
+
